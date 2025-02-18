@@ -1,1 +1,1 @@
-# recommender-3t
+# model_recommendations
