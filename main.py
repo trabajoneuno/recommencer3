@@ -6,11 +6,9 @@ import pandas as pd
 import tensorflow as tf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder
 from contextlib import asynccontextmanager
 
-# Function to get memory usage
 def get_memory_usage_mb():
     process = psutil.Process(os.getpid())
     mem_bytes = process.memory_info().rss
@@ -18,7 +16,7 @@ def get_memory_usage_mb():
 
 print(f"Initial memory usage: {get_memory_usage_mb():.2f} MB")
 
-# Global variables
+# Variables globales
 id_to_name = None
 name_to_id = None
 num_products = None
@@ -26,29 +24,30 @@ product_meta = None
 prod_weights = None
 main_weights = None
 sub_weights = None
+combined_embeddings_norm = None
 
-# Define base directory
+# Directorio base (donde se encuentra el CSV y el modelo)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global id_to_name, name_to_id, num_products, product_meta
-    global prod_weights, main_weights, sub_weights
+    global prod_weights, main_weights, sub_weights, combined_embeddings_norm
 
     print("Starting startup...")
     try:
-        # File paths
+        # Rutas a archivos
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
-
-        # 1. First pass: Collect all unique values
+        
+        # === Primera pasada: recopilar valores únicos ===
         usecols = ["name", "main_category", "sub_category"]
         all_names = set()
         all_main_categories = set()
         all_sub_categories = set()
         
         chunk_size = 1000
-        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size):
+        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size, dtype=str):
             all_names.update(chunk['name'].unique())
             all_main_categories.update(chunk['main_category'].unique())
             all_sub_categories.update(chunk['sub_category'].unique())
@@ -57,7 +56,7 @@ async def lifespan(app: FastAPI):
         print(f"Found {len(all_main_categories)} unique main categories")
         print(f"Found {len(all_sub_categories)} unique sub categories")
         
-        # 2. Create and fit encoders with all unique values
+        # === Ajustar codificadores ===
         name_enc = LabelEncoder()
         main_cat_enc = LabelEncoder()
         sub_cat_enc = LabelEncoder()
@@ -66,35 +65,39 @@ async def lifespan(app: FastAPI):
         main_cat_enc.fit(list(all_main_categories))
         sub_cat_enc.fit(list(all_sub_categories))
         
-        # Create lookup dictionaries
-        id_to_name = dict(zip(range(len(all_names)), name_enc.classes_))
+        # Crear diccionarios de mapeo para productos
+        id_to_name = dict(zip(range(len(name_enc.classes_)), name_enc.classes_))
         name_to_id = {name: idx for idx, name in id_to_name.items()}
-        num_products = len(all_names)
+        num_products = len(name_enc.classes_)
         
-        # 3. Preallocate product_meta array
+        # Preasignar array para metadata de productos:
+        # Columna 0: código de main_category, Columna 1: código de sub_category
         product_meta = np.zeros((num_products, 2), dtype=np.int32)
         
-        # 4. Second pass: Process data for product_meta
-        usecols = ["name", "main_category", "sub_category"]
-        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size):
-            for _, row in chunk.iterrows():
-                try:
-                    pid = name_to_id[row['name']]
-                    main_cat = main_cat_enc.transform([row['main_category']])[0]
-                    sub_cat = sub_cat_enc.transform([row['sub_category']])[0]
-                    product_meta[pid, 0] = main_cat
-                    product_meta[pid, 1] = sub_cat
-                except KeyError as e:
-                    print(f"Warning: Could not process row with name {row['name']}: {e}")
+        # === Segunda pasada: procesar CSV de forma vectorizada ===
+        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size, dtype=str):
+            # Mapear nombres a sus IDs
+            ids = chunk['name'].map(name_to_id)
+            # Omitir registros sin mapeo (por precaución)
+            if ids.isnull().any():
+                valid = ids.notnull()
+                chunk = chunk[valid]
+                ids = ids[valid]
+            ids = ids.astype(np.int32).values
+            # Transformar categorías de forma vectorizada
+            main_encoded = main_cat_enc.transform(chunk['main_category'].values)
+            sub_encoded = sub_cat_enc.transform(chunk['sub_category'].values)
+            # Asignar en el array preasignado
+            product_meta[ids, 0] = main_encoded
+            product_meta[ids, 1] = sub_encoded
         
         print(f"Memory usage after creating metadata: {get_memory_usage_mb():.2f} MB")
         
-        # 5. Load TFLite model
+        # === Cargar modelo TFLite ===
         interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
         print("TFLite model loaded.")
         
-        # Extract embeddings
         def get_embedding_weights(layer_name):
             for tensor_detail in interpreter.get_tensor_details():
                 if layer_name in tensor_detail["name"]:
@@ -103,31 +106,43 @@ async def lifespan(app: FastAPI):
                     if tensor.ndim >= 2:
                         return tensor.astype(np.float32)
             raise ValueError(f"Tensor for {layer_name} with at least 2 dimensions not found")
-
-        # Extract embeddings
+        
         prod_weights = get_embedding_weights("product_embedding")
         main_weights = get_embedding_weights("main_cat_embedding")
         sub_weights = get_embedding_weights("sub_cat_embedding")
         
-        # Free resources
+        # Liberar recursos del intérprete
         del interpreter
-        interpreter = None
         gc.collect()
+        
+        # === Precalcular embeddings combinados normalizados ===
+        # Se asume:
+        # - prod_weights: (num_products, d_prod)
+        # - main_weights: (num_main_categories, d_main)
+        # - sub_weights: (num_sub_categories, d_sub)
+        # Se obtiene combined_embeddings de forma vectorizada:
+        combined_embeddings = np.concatenate([
+            prod_weights,
+            main_weights[product_meta[:, 0]],
+            sub_weights[product_meta[:, 1]]
+        ], axis=1)
+        
+        # Normalizar (añadimos un epsilon para evitar división por cero)
+        norms = np.linalg.norm(combined_embeddings, axis=1, keepdims=True)
+        combined_embeddings_norm = combined_embeddings / (norms + 1e-10)
         
         print(f"Final memory usage after setup: {get_memory_usage_mb():.2f} MB")
         print("Startup completed. API is ready.")
-
+    
     except Exception as e:
         print(f"Error during startup: {str(e)}")
         raise e
-
+    
     yield
     print("Shutting down API...")
 
-# Create FastAPI application
+# Crear aplicación FastAPI y configurar CORS
 app = FastAPI(lifespan=lifespan, title="Product Recommendation API")
-
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -136,63 +151,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Health Check
+# Endpoint de Health Check
 @app.get("/")
 def health_check():
     return {"status": "ok"}
 
-# Functions to get embeddings
-def get_combined_embedding(product_id: int):
-    main_cat = product_meta[product_id, 0]
-    sub_cat = product_meta[product_id, 1]
-    vec_prod = prod_weights[product_id]
-    vec_main = main_weights[main_cat]
-    vec_sub = sub_weights[sub_cat]
-    return np.concatenate([vec_prod, vec_main, vec_sub])
-
-def recomendar_productos_combinados(product_id: int, top_n: int = 5):
-    if product_id < 0 or product_id >= num_products:
-        return []
-    
-    query_vec = get_combined_embedding(product_id).reshape(1, -1)
-    
-    # Memory optimization: Process in batches
-    batch_size = 100
-    similitudes = np.zeros(num_products, dtype=np.float32)
-    
-    for start_idx in range(0, num_products, batch_size):
-        end_idx = min(start_idx + batch_size, num_products)
-        batch_ids = list(range(start_idx, end_idx))
-        
-        # Get embeddings for this batch
-        batch_embeddings = np.vstack([get_combined_embedding(pid) for pid in batch_ids])
-        
-        # Calculate similarities for this batch
-        batch_similarities = cosine_similarity(query_vec, batch_embeddings)[0]
-        similitudes[start_idx:end_idx] = batch_similarities
-    
-    # Get top-n similar products
-    indices_similares = np.argsort(-similitudes)
-    indices_similares = [i for i in indices_similares if i != product_id]
-    return indices_similares[:top_n]
-
-# Recommendation endpoint
+# Endpoint de recomendaciones
 @app.get("/recomendaciones")
 def get_recomendaciones(product_name: str, top_n: int = 5):
+    global id_to_name, name_to_id, combined_embeddings_norm
+    
     if product_name not in name_to_id:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
     
     product_id = name_to_id[product_name]
-    recomendados_ids = recomendar_productos_combinados(product_id, top_n)
+    # Obtener embedding del producto (ya normalizado)
+    query_embedding = combined_embeddings_norm[product_id]
+    # Calcular similitud coseno de forma vectorizada (producto punto)
+    similarities = np.dot(combined_embeddings_norm, query_embedding)
+    # Excluir el propio producto
+    similarities[product_id] = -np.inf
+    
+    # Obtener los índices de los top_n productos recomendados
+    top_indices = np.argpartition(-similarities, top_n)[:top_n]
+    # Ordenarlos de forma descendente según la similitud
+    top_indices = top_indices[np.argsort(-similarities[top_indices])]
     
     recomendaciones = [
         {"id": int(pid), "name": id_to_name.get(int(pid), f"ID {pid}")}
-        for pid in recomendados_ids
+        for pid in top_indices
     ]
     
     return {"producto": product_name, "recomendaciones": recomendaciones}
 
-# Run with Uvicorn if executed directly
+# Ejecutar la aplicación con Uvicorn si se ejecuta directamente
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     import uvicorn
