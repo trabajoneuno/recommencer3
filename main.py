@@ -4,14 +4,14 @@ import psutil
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from typing import Dict, List
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import LabelEncoder
 from contextlib import asynccontextmanager
 import logging
 import tempfile
-from pydantic import BaseModel
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -20,81 +20,114 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants
-MEMORY_LIMIT = 450  # MB
-CHUNK_SIZE = 500
+# Simple FastAPI app - this worked with port binding
+app = FastAPI()
 
-class MemoryMonitor:
-    @staticmethod
-    def get_memory_usage_mb() -> float:
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / (1024 * 1024)
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    @staticmethod
-    def log_memory(message: str):
-        memory_mb = MemoryMonitor.get_memory_usage_mb()
-        logger.info(f"{message} - Memory: {memory_mb:.2f} MB")
-
-class EmbeddingStore:
-    def __init__(self, batch_size: int = 100):
-        self.batch_size = batch_size
-        self.embeddings = {}
-        self._current_batch = []
+class MemoryOptimizedStorage:
+    def __init__(self, chunk_size: int = 100):
+        self.chunk_size = chunk_size
+        self.temp_dir = tempfile.mkdtemp()
+        self.current_chunk = {}
+        self.chunk_files = []
+        logger.info(f"Created temporary directory: {self.temp_dir}")
     
-    def add_embedding(self, idx: int, embedding: np.ndarray):
-        self.embeddings[idx] = embedding.astype(np.float16)  # Use float16 for memory efficiency
+    def add_data(self, idx: int, embedding: np.ndarray):
+        """Add data to current chunk, save if chunk is full"""
+        self.current_chunk[idx] = embedding.astype(np.float16)
         
-        if len(self.embeddings) % self.batch_size == 0:
-            gc.collect()
+        if len(self.current_chunk) >= self.chunk_size:
+            self._save_chunk()
+            
+    def _save_chunk(self):
+        """Save current chunk to disk"""
+        if not self.current_chunk:
+            return
+            
+        chunk_path = Path(self.temp_dir) / f"chunk_{len(self.chunk_files)}.npz"
+        np.savez_compressed(
+            chunk_path,
+            indices=np.array(list(self.current_chunk.keys())),
+            embeddings=np.stack(list(self.current_chunk.values()))
+        )
+        self.chunk_files.append(str(chunk_path))
+        self.current_chunk.clear()
+        gc.collect()
     
-    def get_similarity(self, query_id: int) -> Dict[int, float]:
-        if query_id not in self.embeddings:
+    def get_similarities(self, query_id: int) -> Dict[int, float]:
+        """Calculate similarities efficiently"""
+        similarities = {}
+        query_embedding = None
+        
+        # Find query embedding
+        for chunk_file in self.chunk_files:
+            chunk = np.load(chunk_file)
+            indices = chunk['indices']
+            if query_id in indices:
+                idx = np.where(indices == query_id)[0][0]
+                query_embedding = chunk['embeddings'][idx]
+                break
+                
+        if query_embedding is None and query_id in self.current_chunk:
+            query_embedding = self.current_chunk[query_id]
+            
+        if query_embedding is None:
             raise ValueError(f"Query ID {query_id} not found")
             
-        query_embedding = self.embeddings[query_id]
-        similarities = {}
-        
-        # Process in batches to reduce memory usage
-        batch = []
-        for idx, embedding in self.embeddings.items():
-            if idx != query_id:
-                batch.append((idx, embedding))
-                
-                if len(batch) >= self.batch_size:
-                    self._process_similarity_batch(query_embedding, batch, similarities)
-                    batch = []
+        # Calculate similarities chunk by chunk
+        for chunk_file in self.chunk_files:
+            chunk = np.load(chunk_file)
+            chunk_sims = np.dot(chunk['embeddings'], query_embedding)
+            for idx, sim in zip(chunk['indices'], chunk_sims):
+                if idx != query_id:
+                    similarities[int(idx)] = float(sim)
                     
-        if batch:
-            self._process_similarity_batch(query_embedding, batch, similarities)
-            
+        # Process current chunk
+        for idx, emb in self.current_chunk.items():
+            if idx != query_id:
+                similarities[idx] = float(np.dot(emb, query_embedding))
+                
         return similarities
     
-    def _process_similarity_batch(self, query_embedding: np.ndarray, batch: List, similarities: Dict):
-        batch_embeddings = np.stack([emb for _, emb in batch])
-        batch_similarities = np.dot(batch_embeddings, query_embedding)
-        
-        for (idx, _), sim in zip(batch, batch_similarities):
-            similarities[idx] = float(sim)
+    def cleanup(self):
+        """Remove temporary files"""
+        for file_path in self.chunk_files:
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.error(f"Error removing {file_path}: {e}")
+        try:
+            os.rmdir(self.temp_dir)
+        except Exception as e:
+            logger.error(f"Error removing temp dir: {e}")
 
 class RecommendationSystem:
     def __init__(self):
         self.id_to_name: Dict[int, str] = {}
         self.name_to_id: Dict[str, int] = {}
-        self.embedding_store = EmbeddingStore()
+        self.storage: Optional[MemoryOptimizedStorage] = None
         
     def get_recommendations(self, product_name: str, top_n: int = 5) -> List[Dict]:
+        """Get recommendations with memory optimization"""
         if product_name not in self.name_to_id:
             raise HTTPException(status_code=404, detail="Product not found")
             
         product_id = self.name_to_id[product_name]
-        
         try:
-            similarities = self.embedding_store.get_similarity(product_id)
+            similarities = self.storage.get_similarities(product_id)
             
             # Get top N recommendations
-            sorted_items = sorted(
-                similarities.items(),
-                key=lambda x: x[1],
+            top_ids = sorted(
+                similarities.keys(),
+                key=lambda x: similarities[x],
                 reverse=True
             )[:top_n]
             
@@ -102,9 +135,9 @@ class RecommendationSystem:
                 {
                     "id": int(idx),
                     "name": self.id_to_name[idx],
-                    "similarity": float(sim)
+                    "similarity": float(similarities[idx])
                 }
-                for idx, sim in sorted_items
+                for idx in top_ids
             ]
             
         except Exception as e:
@@ -116,25 +149,31 @@ recommender = RecommendationSystem()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        MemoryMonitor.log_memory("Starting initialization")
+        # Log startup with port information
+        port = os.environ.get("PORT", "10000")
+        logger.info(f"Starting initialization on port {port}")
         
-        # Get paths
+        # Get file paths
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
         
-        # Process unique values
+        # Initialize storage
+        recommender.storage = MemoryOptimizedStorage(chunk_size=100)
+        
+        # Process unique values with minimal memory
         unique_values = {"name": set(), "main_category": set(), "sub_category": set()}
+        chunk_size = 500
         
         for chunk in pd.read_csv(csv_path, 
                                usecols=list(unique_values.keys()),
                                dtype=str,
-                               chunksize=CHUNK_SIZE):
+                               chunksize=chunk_size):
             for col in unique_values:
                 unique_values[col].update(chunk[col].dropna().unique())
             del chunk
             gc.collect()
-            
+        
         # Create encoders
         encoders = {
             col: LabelEncoder().fit(list(values))
@@ -148,25 +187,19 @@ async def lifespan(app: FastAPI):
         # Load TFLite model efficiently
         interpreter = tf.lite.Interpreter(
             model_path=model_path,
-            num_threads=1
+            num_threads=1  # Minimize memory usage
         )
         interpreter.allocate_tensors()
         
         # Process data in chunks
-        for chunk in pd.read_csv(csv_path, chunksize=CHUNK_SIZE, dtype=str):
+        for chunk in pd.read_csv(csv_path, chunksize=chunk_size, dtype=str):
             valid_mask = chunk['name'].isin(recommender.name_to_id)
             if not valid_mask.any():
                 continue
                 
             chunk = chunk[valid_mask]
             for _, row in chunk.iterrows():
-                if MemoryMonitor.get_memory_usage_mb() > MEMORY_LIMIT:
-                    logger.warning("Memory limit approaching, triggering garbage collection")
-                    gc.collect()
-                    
                 product_id = recommender.name_to_id[row['name']]
-                
-                # Get encoded values
                 main_cat_id = encoders["main_category"].transform([row['main_category']])[0]
                 sub_cat_id = encoders["sub_category"].transform([row['sub_category']])[0]
                 
@@ -187,55 +220,50 @@ async def lifespan(app: FastAPI):
                 normalized = combined / (np.linalg.norm(combined) + 1e-8)
                 
                 # Store embedding
-                recommender.embedding_store.add_embedding(product_id, normalized)
-                
+                recommender.storage.add_data(product_id, normalized)
+            
             del chunk
             gc.collect()
         
-        # Clean up
+        # Save final chunk and clean up
+        recommender.storage._save_chunk()
         del interpreter
         gc.collect()
         
-        MemoryMonitor.log_memory("Initialization complete")
+        logger.info("Initialization complete")
+        logger.info(f"Server ready to accept requests on port {port}")
         
     except Exception as e:
         logger.error(f"Startup error: {e}")
         raise
     
     yield
+    
+    # Cleanup on shutdown
+    if recommender.storage:
+        recommender.storage.cleanup()
 
-# Create FastAPI app
-app = FastAPI(
-    title="Product Recommendation API",
-    description="Memory-optimized product recommendation system",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configure FastAPI with lifespan
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
     """Root endpoint for health checks"""
+    memory_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     return {
         "status": "ok",
-        "memory_usage_mb": MemoryMonitor.get_memory_usage_mb()
+        "memory_usage_mb": memory_mb,
+        "port": os.environ.get("PORT", "10000")
     }
 
 @app.get("/health")
 async def health_check():
-    """Detailed health check endpoint"""
+    """Health check endpoint"""
+    memory_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     return {
         "status": "healthy",
-        "memory_usage_mb": MemoryMonitor.get_memory_usage_mb(),
-        "memory_limit_mb": MEMORY_LIMIT,
+        "memory_usage_mb": memory_mb,
+        "port": os.environ.get("PORT", "10000"),
         "num_products": len(recommender.id_to_name)
     }
 
@@ -246,20 +274,3 @@ async def get_recommendations(product_name: str, top_n: int = 5):
         "producto": product_name,
         "recomendaciones": recommender.get_recommendations(product_name, top_n)
     }
-
-if __name__ == "__main__":
-    # Get port from environment variable with fallback to Render's default
-    port = int(os.environ.get("PORT", 10000))
-    
-    # Log the port we're using
-    logger.info(f"Starting server on port {port}")
-    
-    # Run the server
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        workers=1
-    )
