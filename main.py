@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 # Add this import at the top with the other imports
 from typing import Optional
+from contextlib import asynccontextmanager
+
 
 # Configure logging
 logging.basicConfig(
