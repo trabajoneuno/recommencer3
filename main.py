@@ -10,6 +10,8 @@ from sklearn.preprocessing import LabelEncoder
 import logging
 import tempfile
 from pathlib import Path
+# Add this import at the top with the other imports
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(
@@ -234,4 +236,57 @@ async def get_recommendations(product_name: str, top_n: int = 5):
     return {
         "producto": product_name,
         "recomendaciones": recommender.get_recommendations(product_name, top_n)
+    }
+
+# Add this new endpoint after the existing endpoints
+@app.get("/productos")
+async def list_products(
+    page: Optional[int] = 1,
+    page_size: Optional[int] = 50,
+    search: Optional[str] = None
+):
+    """
+    List available products with optional pagination and search.
+    
+    Args:
+        page: Current page number (1-based indexing)
+        page_size: Number of items per page
+        search: Optional search term to filter products
+    """
+    # Validate pagination parameters
+    if page < 1:
+        raise HTTPException(status_code=400, detail="Page number must be >= 1")
+    if page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=400, detail="Page size must be between 1 and 100")
+    
+    # Get all product names
+    products = list(recommender.name_to_id.keys())
+    
+    # Apply search filter if provided
+    if search:
+        search = search.lower()
+        products = [p for p in products if search in p.lower()]
+    
+    # Sort products alphabetically for consistent pagination
+    products.sort()
+    
+    # Calculate pagination
+    total_products = len(products)
+    total_pages = (total_products + page_size - 1) // page_size
+    
+    # Adjust page if it exceeds total pages
+    if page > total_pages and total_pages > 0:
+        raise HTTPException(status_code=404, detail="Page not found")
+    
+    # Get paginated results
+    start_idx = (page - 1) * page_size
+    end_idx = min(start_idx + page_size, total_products)
+    page_products = products[start_idx:end_idx]
+    
+    return {
+        "productos": page_products,
+        "pagina_actual": page,
+        "total_paginas": total_pages,
+        "productos_por_pagina": page_size,
+        "total_productos": total_products
     }
