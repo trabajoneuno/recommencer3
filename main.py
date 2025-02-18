@@ -20,22 +20,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create the FastAPI app first - this is what worked for port binding
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def startup_event():
-    port = os.environ.get("PORT", 10000)
-    logger.info(f"Application startup on port {port}")
-
 class MemoryMappedStore:
     def __init__(self):
         self.temp_file = None
@@ -44,13 +28,11 @@ class MemoryMappedStore:
         self.current_index = 0
         
     def initialize(self, embedding_size: int, max_items: int):
-        # Create temporary file
         self.temp_file = tempfile.NamedTemporaryFile(delete=False)
-        array_size = max_items * embedding_size * 4  # 4 bytes per float32
+        array_size = max_items * embedding_size * 4
         self.temp_file.write(b'\0' * array_size)
         self.temp_file.flush()
         
-        # Create memory-mapped array
         self.mmap_array = np.memmap(
             self.temp_file.name,
             dtype=np.float32,
@@ -131,7 +113,7 @@ async def lifespan(app: FastAPI):
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
         
-        # Count total products for initialization
+        # Count total products
         total_products = 0
         chunk_size = 500
         for chunk in pd.read_csv(csv_path, usecols=['name'], chunksize=chunk_size):
@@ -160,7 +142,7 @@ async def lifespan(app: FastAPI):
         recommender.id_to_name = dict(enumerate(encoders["name"].classes_))
         recommender.name_to_id = {name: idx for idx, name in recommender.id_to_name.items()}
         
-        # Load TFLite model efficiently
+        # Load TFLite model
         interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=1)
         interpreter.allocate_tensors()
         
@@ -178,7 +160,7 @@ async def lifespan(app: FastAPI):
             max_items=total_products
         )
         
-        # Process data in chunks
+        # Process data
         for chunk in pd.read_csv(csv_path, chunksize=chunk_size, dtype=str):
             valid_mask = chunk['name'].isin(recommender.name_to_id)
             if not valid_mask.any():
@@ -212,7 +194,7 @@ async def lifespan(app: FastAPI):
             del chunk
             gc.collect()
         
-        # Clean up TF interpreter
+        # Clean up
         del interpreter
         gc.collect()
         
@@ -224,11 +206,26 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup on shutdown
+    # Cleanup
     recommender.embedding_store.cleanup()
 
-# Add lifespan to app
+# Create FastAPI app 
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Log port information on startup"""
+    port = os.environ.get("PORT", 10000)
+    logger.info(f"Application startup on port {port}")
 
 @app.get("/")
 async def root():
@@ -236,7 +233,8 @@ async def root():
     memory_mb = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     return {
         "status": "ok",
-        "memory_usage_mb": memory_mb
+        "memory_usage_mb": memory_mb,
+        "port": os.environ.get("PORT", 10000)
     }
 
 @app.get("/health")
@@ -246,6 +244,7 @@ async def health_check():
     return {
         "status": "healthy",
         "memory_usage_mb": memory_mb,
+        "port": os.environ.get("PORT", 10000),
         "num_products": len(recommender.id_to_name)
     }
 
