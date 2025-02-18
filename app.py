@@ -3,7 +3,7 @@ import pickle
 import pandas as pd
 from pathlib import Path
 import os
-from recommender import ImprovedRecommender
+from recommender import ImprovedRecommender  # Importamos la clase antes de cargar el pickle
 
 app = Flask(__name__)
 
@@ -17,22 +17,47 @@ def init_app():
     global recommender, products_df, interactions_df
     
     try:
+        print("Iniciando carga de modelos...")
         models_dir = Path("models")
-        with open(models_dir / 'recommender.pkl', 'rb') as f:
-            recommender = pickle.load(f)
+        
+        # Primero cargamos los DataFrames
+        print("Cargando DataFrames...")
         products_df = pd.read_pickle(models_dir / 'products_df.pkl')
         interactions_df = pd.read_pickle(models_dir / 'interactions_df.pkl')
+        
+        # Luego cargamos el recomendador
+        print("Cargando recomendador...")
+        with open(models_dir / 'recommender.pkl', 'rb') as f:
+            recommender = pickle.load(f)
+            
+        print("Inicializando directorio de datos...")
+        # Nos aseguramos que el directorio de datos exista
+        recommender.data_dir = Path('recommender_data')
+        recommender.data_dir.mkdir(exist_ok=True)
+        
         print("Modelos cargados exitosamente")
     except Exception as e:
-        print(f"Error loading models: {e}")
+        print(f"Error loading models: {str(e)}")
         raise e
 
-# Cargar modelos al iniciar
-init_app()
+@app.before_first_request
+def load_models():
+    """Cargar modelos antes de la primera petición"""
+    if recommender is None:
+        init_app()
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Endpoint para verificar que la API está funcionando"""
+    if recommender is None:
+        try:
+            init_app()
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "error": str(e)
+            }), 500
+            
     return jsonify({
         "status": "healthy",
         "recommender_loaded": recommender is not None,
@@ -95,4 +120,5 @@ def get_popular_recommendations():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    init_app()  # Inicializamos al arrancar en desarrollo
     app.run(host='0.0.0.0', port=port)
