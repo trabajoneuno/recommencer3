@@ -4,9 +4,9 @@ import pandas as pd
 from pathlib import Path
 import os
 import logging
-import psutil
 import gc
 import numpy as np
+import sys
 from recommender import ImprovedRecommender
 
 # Configure logging
@@ -19,10 +19,15 @@ products_df = None
 interactions_df = None
 
 def log_memory_usage(tag=""):
-    """Log current memory usage of process"""
-    process = psutil.Process(os.getpid())
-    memory_mb = process.memory_info().rss / 1024 / 1024
-    logger.info(f"Memory usage {tag}: {memory_mb:.2f} MB")
+    """Log current memory usage using tracemalloc"""
+    try:
+        import resource
+        memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        memory_mb = memory_kb / 1024  # Convert to MB
+        logger.info(f"Memory usage {tag}: {memory_mb:.2f} MB")
+    except ImportError:
+        # If resource module is not available
+        logger.info(f"Memory logging not available for: {tag}")
 
 class CustomUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
@@ -178,9 +183,13 @@ def health_check():
         if init_success:
             patch_recommender()
     
-    # Include memory info in health check
-    process = psutil.Process(os.getpid())
-    memory_mb = process.memory_info().rss / 1024 / 1024
+    # Include basic memory info in health check
+    try:
+        import resource
+        memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        memory_mb = memory_kb / 1024  # Convert to MB
+    except ImportError:
+        memory_mb = -1  # Not available
     
     return jsonify({
         "status": "healthy" if init_success else "error",
@@ -350,9 +359,4 @@ def get_recommendations():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    
-    # Configure workers to be memory-aware
-    memory_mb = psutil.virtual_memory().total / 1024 / 1024
-    logger.info(f"Total system memory: {memory_mb:.2f} MB")
-    
     app.run(host='0.0.0.0', port=port)
