@@ -7,28 +7,45 @@ from recommender import ImprovedRecommender
 
 app = Flask(__name__)
 
-# Cargar el modelo y datos al inicio
-def load_models():
-    models_dir = Path("models")
-    with open(models_dir / 'recommender.pkl', 'rb') as f:
-        recommender = pickle.load(f)
-    products_df = pd.read_pickle(models_dir / 'products_df.pkl')
-    interactions_df = pd.read_pickle(models_dir / 'interactions_df.pkl')
-    return recommender, products_df, interactions_df
+# Variables globales para el modelo y datos
+recommender = None
+products_df = None
+interactions_df = None
 
-try:
-    recommender, products_df, interactions_df = load_models()
-except Exception as e:
-    print(f"Error loading models: {e}")
+def init_app():
+    """Inicializar la aplicación y cargar los modelos"""
+    global recommender, products_df, interactions_df
+    
+    try:
+        models_dir = Path("models")
+        with open(models_dir / 'recommender.pkl', 'rb') as f:
+            recommender = pickle.load(f)
+        products_df = pd.read_pickle(models_dir / 'products_df.pkl')
+        interactions_df = pd.read_pickle(models_dir / 'interactions_df.pkl')
+        print("Modelos cargados exitosamente")
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        raise e
+
+# Cargar modelos al iniciar
+init_app()
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Endpoint para verificar que la API está funcionando"""
-    return jsonify({"status": "healthy"}), 200
+    return jsonify({
+        "status": "healthy",
+        "recommender_loaded": recommender is not None,
+        "products_loaded": products_df is not None,
+        "interactions_loaded": interactions_df is not None
+    }), 200
 
 @app.route('/recommend/user/<int:user_id>', methods=['GET'])
 def get_user_recommendations(user_id):
     """Obtener recomendaciones para un usuario específico"""
+    if recommender is None:
+        return jsonify({"error": "Recommender system not initialized"}), 500
+        
     try:
         n_recommendations = int(request.args.get('n', 5))
         recommendations = recommender.get_recommendations(user_id, n_recommendations)
@@ -42,6 +59,9 @@ def get_user_recommendations(user_id):
 @app.route('/recommend/history', methods=['POST'])
 def get_history_recommendations():
     """Obtener recomendaciones basadas en historial de productos"""
+    if recommender is None:
+        return jsonify({"error": "Recommender system not initialized"}), 500
+        
     try:
         data = request.get_json()
         if not data or 'product_ids' not in data:
@@ -61,6 +81,9 @@ def get_history_recommendations():
 @app.route('/recommend/popular', methods=['GET'])
 def get_popular_recommendations():
     """Obtener recomendaciones populares"""
+    if recommender is None:
+        return jsonify({"error": "Recommender system not initialized"}), 500
+        
     try:
         n_recommendations = int(request.args.get('n', 5))
         recommendations = recommender._get_popular_recommendations(n_recommendations)
