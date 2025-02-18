@@ -10,11 +10,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import LabelEncoder
 from contextlib import asynccontextmanager
 
-# Memory optimization: Use memory-mapped files
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MEM_MAP_DIR = os.path.join(BASE_DIR, "mem_maps")
-os.makedirs(MEM_MAP_DIR, exist_ok=True)
-
 # Function to get memory usage
 def get_memory_usage_mb():
     process = psutil.Process(os.getpid())
@@ -23,21 +18,22 @@ def get_memory_usage_mb():
 
 print(f"Initial memory usage: {get_memory_usage_mb():.2f} MB")
 
-# Global variables (minimized)
+# Global variables
 id_to_name = None
 name_to_id = None
 num_products = None
 product_meta = None
+prod_weights = None
+main_weights = None
+sub_weights = None
 
-# Memory-mapped embedding arrays
-prod_weights_mmap = None
-main_weights_mmap = None
-sub_weights_mmap = None
+# Define base directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global id_to_name, name_to_id, num_products, product_meta
-    global prod_weights_mmap, main_weights_mmap, sub_weights_mmap
+    global prod_weights, main_weights, sub_weights
 
     print("Starting startup...")
     try:
@@ -45,77 +41,73 @@ async def lifespan(app: FastAPI):
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
 
-        # Memory optimization: Load only essential columns and process in chunks
-        usecols = ["name", "discount_price", "actual_price", "main_category", "sub_category"]
+        # 1. First pass: Collect all unique values
+        usecols = ["name", "main_category", "sub_category"]
+        all_names = set()
+        all_main_categories = set()
+        all_sub_categories = set()
         
-        # First pass to count rows
-        num_rows = sum(1 for _ in open(csv_path)) - 1
+        chunk_size = 1000
+        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size):
+            all_names.update(chunk['name'].unique())
+            all_main_categories.update(chunk['main_category'].unique())
+            all_sub_categories.update(chunk['sub_category'].unique())
         
-        # Initialize encoders
+        print(f"Found {len(all_names)} unique products")
+        print(f"Found {len(all_main_categories)} unique main categories")
+        print(f"Found {len(all_sub_categories)} unique sub categories")
+        
+        # 2. Create and fit encoders with all unique values
         name_enc = LabelEncoder()
         main_cat_enc = LabelEncoder()
         sub_cat_enc = LabelEncoder()
         
-        # Process the file in chunks to fit all unique values
-        chunk_size = 1000
+        name_enc.fit(list(all_names))
+        main_cat_enc.fit(list(all_main_categories))
+        sub_cat_enc.fit(list(all_sub_categories))
+        
+        # Create lookup dictionaries
+        id_to_name = dict(zip(range(len(all_names)), name_enc.classes_))
+        name_to_id = {name: idx for idx, name in id_to_name.items()}
+        num_products = len(all_names)
+        
+        # 3. Preallocate product_meta array
+        product_meta = np.zeros((num_products, 2), dtype=np.int32)
+        
+        # 4. Second pass: Process data for product_meta
+        usecols = ["name", "main_category", "sub_category"]
         for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size):
-            name_enc.fit(chunk['name'])
-            main_cat_enc.fit(chunk['main_category'])
-            sub_cat_enc.fit(chunk['sub_category'])
-        
-        # Create dictionaries for lookups
-        unique_names = name_enc.classes_
-        id_to_name = {i: name for i, name in enumerate(unique_names)}
-        name_to_id = {name: i for i, name in enumerate(unique_names)}
-        
-        num_products = len(unique_names)
-        print(f"Total unique products: {num_products}")
-        
-        # Memory optimization: Pre-allocate product_meta array as memory-mapped file
-        product_meta_path = os.path.join(MEM_MAP_DIR, "product_meta.npy")
-        product_meta = np.memmap(product_meta_path, dtype=np.int16, mode='w+', shape=(num_products, 2))
-        
-        # Process in chunks to populate product_meta
-        curr_idx = 0
-        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size):
-            chunk_size = len(chunk)
             for _, row in chunk.iterrows():
-                pid = name_enc.transform([row['name']])[0]
-                main_cat = main_cat_enc.transform([row['main_category']])[0]
-                sub_cat = sub_cat_enc.transform([row['sub_category']])[0]
-                product_meta[pid, 0] = main_cat
-                product_meta[pid, 1] = sub_cat
-            
-            curr_idx += chunk_size
-            print(f"Processed {curr_idx}/{num_rows} rows")
+                try:
+                    pid = name_to_id[row['name']]
+                    main_cat = main_cat_enc.transform([row['main_category']])[0]
+                    sub_cat = sub_cat_enc.transform([row['sub_category']])[0]
+                    product_meta[pid, 0] = main_cat
+                    product_meta[pid, 1] = sub_cat
+                except KeyError as e:
+                    print(f"Warning: Could not process row with name {row['name']}: {e}")
         
         print(f"Memory usage after creating metadata: {get_memory_usage_mb():.2f} MB")
         
-        # Load TFLite model
+        # 5. Load TFLite model
         interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
         print("TFLite model loaded.")
         
-        # Function to extract embedding weights and save as memory-mapped file
-        def get_embedding_weights(layer_name, shape_hint=None):
+        # Extract embeddings
+        def get_embedding_weights(layer_name):
             for tensor_detail in interpreter.get_tensor_details():
                 if layer_name in tensor_detail["name"]:
                     tensor = interpreter.get_tensor(tensor_detail["index"])
                     print(f"Found tensor: {tensor_detail['name']} with shape {tensor.shape}")
                     if tensor.ndim >= 2:
-                        # Save to memory-mapped file
-                        output_path = os.path.join(MEM_MAP_DIR, f"{layer_name}.npy")
-                        tensor_mmap = np.memmap(output_path, dtype=np.float16, mode='w+', shape=tensor.shape)
-                        tensor_mmap[:] = tensor.astype(np.float16)
-                        tensor_mmap.flush()
-                        return tensor_mmap
-            
+                        return tensor.astype(np.float32)
             raise ValueError(f"Tensor for {layer_name} with at least 2 dimensions not found")
 
-        # Extract embeddings as memory-mapped files
-        prod_weights_mmap = get_embedding_weights("product_embedding")
-        main_weights_mmap = get_embedding_weights("main_cat_embedding")
-        sub_weights_mmap = get_embedding_weights("sub_cat_embedding")
+        # Extract embeddings
+        prod_weights = get_embedding_weights("product_embedding")
+        main_weights = get_embedding_weights("main_cat_embedding")
+        sub_weights = get_embedding_weights("sub_cat_embedding")
         
         # Free resources
         del interpreter
@@ -126,22 +118,11 @@ async def lifespan(app: FastAPI):
         print("Startup completed. API is ready.")
 
     except Exception as e:
-        print("Error during startup:", e)
+        print(f"Error during startup: {str(e)}")
         raise e
 
     yield
     print("Shutting down API...")
-    
-    # Clean up memory-mapped files
-    if prod_weights_mmap is not None:
-        del prod_weights_mmap
-    if main_weights_mmap is not None:
-        del main_weights_mmap
-    if sub_weights_mmap is not None:
-        del sub_weights_mmap
-    if product_meta is not None:
-        del product_meta
-    gc.collect()
 
 # Create FastAPI application
 app = FastAPI(lifespan=lifespan, title="Product Recommendation API")
@@ -160,25 +141,24 @@ app.add_middleware(
 def health_check():
     return {"status": "ok"}
 
-# Optimized functions to get embeddings
+# Functions to get embeddings
 def get_combined_embedding(product_id: int):
     main_cat = product_meta[product_id, 0]
     sub_cat = product_meta[product_id, 1]
-    vec_prod = prod_weights_mmap[product_id].astype(np.float16)
-    vec_main = main_weights_mmap[main_cat].astype(np.float16)
-    vec_sub = sub_weights_mmap[sub_cat].astype(np.float16)
+    vec_prod = prod_weights[product_id]
+    vec_main = main_weights[main_cat]
+    vec_sub = sub_weights[sub_cat]
     return np.concatenate([vec_prod, vec_main, vec_sub])
 
-# Optimized recommendation function
 def recomendar_productos_combinados(product_id: int, top_n: int = 5):
     if product_id < 0 or product_id >= num_products:
         return []
     
     query_vec = get_combined_embedding(product_id).reshape(1, -1)
     
-    # Memory optimization: Process in batches instead of all at once
+    # Memory optimization: Process in batches
     batch_size = 100
-    similitudes = np.zeros(num_products, dtype=np.float16)
+    similitudes = np.zeros(num_products, dtype=np.float32)
     
     for start_idx in range(0, num_products, batch_size):
         end_idx = min(start_idx + batch_size, num_products)
