@@ -4,58 +4,160 @@ import pandas as pd
 from pathlib import Path
 import os
 import logging
+import psutil
+import gc
+import numpy as np
 from recommender import ImprovedRecommender
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Variables globales para el modelo y datos
+# Global variables for model and data
 recommender = None
 products_df = None
 interactions_df = None
 
+def log_memory_usage(tag=""):
+    """Log current memory usage of process"""
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    logger.info(f"Memory usage {tag}: {memory_mb:.2f} MB")
+
 class CustomUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        # Si el pickle busca __main__.ImprovedRecommender, redirige a recommender.ImprovedRecommender
+        # If pickle is looking for __main__.ImprovedRecommender, redirect to recommender.ImprovedRecommender
         if module == "__main__" and name == "ImprovedRecommender":
             module = "recommender"
         return super().find_class(module, name)
 
 def init_app():
-    """Inicializar la aplicación y cargar los modelos"""
+    """Initialize the application and load models with memory optimization"""
     global recommender, products_df, interactions_df
     
     try:
-        logger.info("Iniciando carga de modelos...")
+        logger.info("Starting model loading...")
+        log_memory_usage("before loading")
         models_dir = Path("models")
         
-        # Primero cargamos los DataFrames
-        logger.info("Cargando DataFrames...")
-        products_df = pd.read_pickle(models_dir / 'products_df.pkl')
-        interactions_df = pd.read_pickle(models_dir / 'interactions_df.pkl')
+        # Load DataFrames with optimization
+        logger.info("Loading DataFrames...")
         
-        # Luego cargamos el recomendador, usando CustomUnpickler para redirigir correctamente
-        logger.info("Cargando recomendador...")
+        # Optimize DataFrame loading - use appropriate dtypes
+        try:
+            with open(models_dir / 'products_df_dtypes.json', 'r') as f:
+                import json
+                dtypes = json.load(f)
+                products_df = pd.read_pickle(models_dir / 'products_df.pkl')
+                # Convert columns to optimized dtypes
+                for col, dtype in dtypes.items():
+                    if dtype.startswith('int'):
+                        products_df[col] = pd.to_numeric(products_df[col], downcast='integer')
+                    elif dtype.startswith('float'):
+                        products_df[col] = pd.to_numeric(products_df[col], downcast='float')
+                    elif dtype == 'category':
+                        products_df[col] = products_df[col].astype('category')
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Fallback if dtypes file doesn't exist
+            products_df = pd.read_pickle(models_dir / 'products_df.pkl')
+            # Automatically optimize common columns
+            for col in products_df.columns:
+                if products_df[col].dtype == 'object' and products_df[col].nunique() / len(products_df) < 0.5:
+                    products_df[col] = products_df[col].astype('category')
+        
+        log_memory_usage("after loading products_df")
+        
+        # Similar optimization for interactions_df
+        interactions_df = pd.read_pickle(models_dir / 'interactions_df.pkl')
+        for col in interactions_df.select_dtypes(include=['int']).columns:
+            interactions_df[col] = pd.to_numeric(interactions_df[col], downcast='integer')
+        for col in interactions_df.select_dtypes(include=['float']).columns:
+            interactions_df[col] = pd.to_numeric(interactions_df[col], downcast='float')
+        
+        log_memory_usage("after loading interactions_df")
+        
+        # Run garbage collection to free memory
+        gc.collect()
+        
+        # Load recommender with a memory-efficient approach
+        logger.info("Loading recommender...")
         with open(models_dir / 'recommender.pkl', 'rb') as f:
             recommender = CustomUnpickler(f).load()
-            
-        logger.info("Inicializando directorio de datos...")
-        # Nos aseguramos que el directorio de datos exista
+        
+        log_memory_usage("after loading recommender")
+        
+        # Initialize data directory
+        logger.info("Initializing data directory...")
         recommender.data_dir = Path('recommender_data')
         recommender.data_dir.mkdir(exist_ok=True)
         
-        logger.info("Modelos cargados exitosamente")
+        # Update recommender with DataFrames (if needed by your implementation)
+        recommender.products_df = products_df
+        recommender.interactions_df = interactions_df
+        
+        # Run garbage collection again
+        gc.collect()
+        log_memory_usage("after initialization")
+        
+        logger.info("Models loaded successfully")
         return True
     except Exception as e:
         logger.error(f"Error loading models: {str(e)}")
         return False
 
-# Inicializar la aplicación Flask
+# Modified ImprovedRecommender methods for batch processing
+def patch_recommender():
+    """Monkey patch the recommender with optimized methods"""
+    global recommender
+    
+    original_get_recommendations_from_history = recommender.get_recommendations_from_history
+    
+    def optimized_get_recommendations_from_history(self, product_ids, n_recommendations=5):
+        """Batch process recommendations to optimize memory usage"""
+        # Process in batches to avoid memory issues
+        batch_size = 10  # Adjust based on your memory constraints
+        unique_products = list(set(product_ids))  # Remove duplicates
+        
+        if len(unique_products) <= batch_size:
+            # If small enough, process normally
+            return original_get_recommendations_from_history(unique_products, n_recommendations)
+        
+        # For larger lists, process in batches and merge results
+        all_results = []
+        for i in range(0, len(unique_products), batch_size):
+            batch = unique_products[i:i+batch_size]
+            log_memory_usage(f"before batch {i//batch_size}")
+            batch_results = original_get_recommendations_from_history(batch, n_recommendations)
+            all_results.extend(batch_results)
+            # Clear memory
+            gc.collect()
+            log_memory_usage(f"after batch {i//batch_size}")
+        
+        # Deduplicate and sort by relevance (assuming recommender returns items with scores)
+        # This part depends on your recommender's output format - adjust as needed
+        if all_results and isinstance(all_results[0], tuple) and len(all_results[0]) == 2:
+            # If results are (product_id, score) tuples
+            unique_results = {}
+            for product_id, score in all_results:
+                if product_id not in unique_results or score > unique_results[product_id]:
+                    unique_results[product_id] = score
+            sorted_results = sorted(unique_results.items(), key=lambda x: x[1], reverse=True)
+            return sorted_results[:n_recommendations]
+        else:
+            # If results are just product IDs
+            unique_results = list(dict.fromkeys(all_results))  # Preserve order while removing duplicates
+            return unique_results[:n_recommendations]
+    
+    # Replace the method
+    recommender.get_recommendations_from_history = optimized_get_recommendations_from_history.__get__(recommender)
+
+# Initialize Flask application
 app = Flask(__name__)
 
-# Intentar cargar los modelos al inicio
+# Try to load models at startup
 init_success = init_app()
+if init_success:
+    patch_recommender()
 
 @app.route('/', methods=['GET'])
 def home():
@@ -68,34 +170,49 @@ def home():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Endpoint para verificar que la API está funcionando"""
+    """Endpoint to verify API is functioning"""
     global init_success, recommender, products_df, interactions_df
     
     if not init_success:
         init_success = init_app()
-        
+        if init_success:
+            patch_recommender()
+    
+    # Include memory info in health check
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    
     return jsonify({
         "status": "healthy" if init_success else "error",
         "recommender_loaded": recommender is not None,
         "products_loaded": products_df is not None,
-        "interactions_loaded": interactions_df is not None
+        "interactions_loaded": interactions_df is not None,
+        "memory_usage_mb": memory_mb
     }), 200 if init_success else 500
 
 @app.route('/recommend/user/<int:user_id>', methods=['GET'])
 def get_user_recommendations(user_id):
-    """Obtener recomendaciones para un usuario específico"""
+    """Get recommendations for a specific user"""
     global init_success, recommender
     
     if not init_success:
         init_success = init_app()
+        if init_success:
+            patch_recommender()
     
     if not init_success:
         return jsonify({"error": "Recommender system not initialized"}), 500
-        
+    
     try:
+        log_memory_usage(f"before user recs {user_id}")
         n_recommendations = int(request.args.get('n', 5))
         logger.info(f"Getting recommendations for user {user_id}")
         recommendations = recommender.get_recommendations(user_id, n_recommendations)
+        log_memory_usage(f"after user recs {user_id}")
+        
+        # Force garbage collection
+        gc.collect()
+        
         return jsonify({
             "user_id": user_id,
             "recommendations": recommendations
@@ -106,25 +223,37 @@ def get_user_recommendations(user_id):
 
 @app.route('/recommend/history', methods=['POST'])
 def get_history_recommendations():
-    """Obtener recomendaciones basadas en historial de productos"""
+    """Get recommendations based on product history"""
     global init_success, recommender
     
     if not init_success:
         init_success = init_app()
+        if init_success:
+            patch_recommender()
     
     if not init_success:
         return jsonify({"error": "Recommender system not initialized"}), 500
-        
+    
     try:
         data = request.get_json()
         if not data or 'product_ids' not in data:
             return jsonify({"error": "product_ids list is required"}), 400
-            
+        
         product_ids = data['product_ids']
         n_recommendations = data.get('n', 5)
         
+        # Log memory before processing
+        log_memory_usage(f"before history recs {product_ids[:5]}...")
+        
         logger.info(f"Getting recommendations from product history: {product_ids}")
         recommendations = recommender.get_recommendations_from_history(product_ids, n_recommendations)
+        
+        # Log memory after processing
+        log_memory_usage(f"after history recs {product_ids[:5]}...")
+        
+        # Force garbage collection
+        gc.collect()
+        
         return jsonify({
             "product_history": product_ids,
             "recommendations": recommendations
@@ -135,19 +264,27 @@ def get_history_recommendations():
 
 @app.route('/recommend/popular', methods=['GET'])
 def get_popular_recommendations():
-    """Obtener recomendaciones populares"""
+    """Get popular recommendations"""
     global init_success, recommender
     
     if not init_success:
         init_success = init_app()
+        if init_success:
+            patch_recommender()
     
     if not init_success:
         return jsonify({"error": "Recommender system not initialized"}), 500
-        
+    
     try:
+        log_memory_usage("before popular recs")
         n_recommendations = int(request.args.get('n', 5))
         logger.info("Getting popular recommendations")
         recommendations = recommender._get_popular_recommendations(n_recommendations)
+        log_memory_usage("after popular recs")
+        
+        # Force garbage collection
+        gc.collect()
+        
         return jsonify({
             "recommendations": recommendations
         })
@@ -158,12 +295,14 @@ def get_popular_recommendations():
 @app.route('/recommend', methods=['POST'])
 def get_recommendations():
     """
-    Endpoint unificado para obtener recomendaciones de productos.
+    Unified endpoint for product recommendations.
     """
     global init_success, recommender
     
     if not init_success:
         init_success = init_app()
+        if init_success:
+            patch_recommender()
     
     if not init_success:
         return jsonify({"error": "Recommender system not initialized"}), 500
@@ -174,6 +313,9 @@ def get_recommendations():
             return jsonify({"error": "Request body is required"}), 400
         
         n_recommendations = data.get('n_recommendations', 5)
+        
+        # Log memory before processing
+        log_memory_usage("before unified recs")
         
         if 'user_id' in data and data['user_id'] is not None:
             user_id = data['user_id']
@@ -194,7 +336,13 @@ def get_recommendations():
             recommendations = recommender._get_popular_recommendations(
                 n_recommendations=n_recommendations
             )
-
+        
+        # Log memory after processing
+        log_memory_usage("after unified recs")
+        
+        # Force garbage collection
+        gc.collect()
+        
         return jsonify({"recommendations": recommendations})
     except Exception as e:
         logger.error(f"Error getting recommendations: {str(e)}")
@@ -202,4 +350,9 @@ def get_recommendations():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    
+    # Configure workers to be memory-aware
+    memory_mb = psutil.virtual_memory().total / 1024 / 1024
+    logger.info(f"Total system memory: {memory_mb:.2f} MB")
+    
     app.run(host='0.0.0.0', port=port)
