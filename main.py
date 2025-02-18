@@ -32,6 +32,118 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global df, interpreter, id_to_name, name_to_id
+    global prod_weights, main_weights, sub_weights, num_products, product_meta
+
+    print("\n=== INICIO DEL PROCESO DE CARGA ===")
+    try:
+        # Verificar rutas de archivos
+        csv_path = os.path.join(BASE_DIR, "productos.csv")
+        model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
+        
+        print(f"\n1. Verificación de archivos:")
+        print(f"   - BASE_DIR: {BASE_DIR}")
+        print(f"   - CSV Path: {csv_path}")
+        print(f"   - ¿Existe CSV?: {os.path.exists(csv_path)}")
+        
+        if not os.path.exists(csv_path):
+            print("   - Contenido del directorio:")
+            for file in os.listdir(BASE_DIR):
+                print(f"     * {file}")
+            raise FileNotFoundError(f"No se encontró productos.csv en {csv_path}")
+
+        # 1. Cargar CSV con debug
+        print("\n2. Cargando CSV:")
+        usecols = ["name", "discount_price", "actual_price", "main_category", "sub_category"]
+        print(f"   - Columnas a cargar: {usecols}")
+        
+        try:
+            # Primero leer solo las primeras líneas para verificar
+            print("   - Verificando primeras líneas del CSV:")
+            df_preview = pd.read_csv(csv_path, nrows=5)
+            print("   - Columnas encontradas en CSV:", df_preview.columns.tolist())
+            
+            # Cargar el CSV completo
+            df = pd.read_csv(csv_path, usecols=usecols, dtype=str)
+            print(f"   - CSV cargado exitosamente con {len(df)} filas")
+            print(f"   - Muestra de datos:\n{df.head()}")
+            
+            # Verificar valores nulos
+            null_counts = df.isnull().sum()
+            print(f"   - Valores nulos por columna:\n{null_counts}")
+            
+        except Exception as e:
+            print(f"   - Error al cargar CSV: {str(e)}")
+            raise
+
+        # Debug de procesamiento de precios
+        print("\n3. Procesamiento de precios:")
+        try:
+            print("   - Valores únicos en discount_price antes de limpieza:", df['discount_price'].unique()[:5])
+            df['discount_price'] = df['discount_price'].str.replace('₹', '').str.replace(',', '')
+            print("   - Valores después de limpieza:", df['discount_price'].unique()[:5])
+            df['discount_price'] = df['discount_price'].astype(np.float32)
+            print("   - Valores después de conversión a float:", df['discount_price'].unique()[:5])
+            
+            # Repetir para actual_price
+            print("\n   - Procesando actual_price...")
+            df['actual_price'] = df['actual_price'].str.replace('₹', '').str.replace(',', '').astype(np.float32)
+        except Exception as e:
+            print(f"   - Error en procesamiento de precios: {str(e)}")
+            raise
+
+        # Debug de codificación de variables
+        print("\n4. Codificación de variables:")
+        try:
+            name_enc = LabelEncoder()
+            print("   - Nombres únicos antes de codificación:", len(df['name'].unique()))
+            df['name_encoded'] = name_enc.fit_transform(df['name'])
+            print("   - Nombres únicos después de codificación:", len(df['name_encoded'].unique()))
+            print("   - Muestra de codificación:")
+            sample_encoding = df[['name', 'name_encoded']].head()
+            print(sample_encoding)
+            
+            # Crear y verificar mapeos
+            id_to_name = dict(zip(df['name_encoded'], df['name']))
+            name_to_id = {v: k for k, v in id_to_name.items()}
+            
+            print(f"\n5. Verificación de mapeos:")
+            print(f"   - Tamaño de id_to_name: {len(id_to_name)}")
+            print(f"   - Tamaño de name_to_id: {len(name_to_id)}")
+            print(f"   - Primeros 5 elementos de name_to_id:")
+            for i, (k, v) in enumerate(list(name_to_id.items())[:5]):
+                print(f"     {k}: {v}")
+            
+            # Verificar integridad de los mapeos
+            print("\n6. Verificación de integridad:")
+            print(f"   - ¿Todos los IDs tienen nombre?: {all(i in id_to_name for i in range(len(id_to_name)))}")
+            print(f"   - ¿Todos los nombres tienen ID?: {all(name in name_to_id for name in df['name'])}")
+            
+            # Verificar duplicados
+            duplicates = df['name'].value_counts()[df['name'].value_counts() > 1]
+            if not duplicates.empty:
+                print("\n   - Nombres duplicados encontrados:")
+                print(duplicates)
+            
+        except Exception as e:
+            print(f"   - Error en codificación de variables: {str(e)}")
+            raise
+
+        print("\n=== FIN DEL PROCESO DE CARGA ===")
+
+    except Exception as e:
+        print(f"\nERROR FATAL: {str(e)}")
+        import traceback
+        print(f"Traceback completo:\n{traceback.format_exc()}")
+        raise e
+
+    yield
+    print("Apagando API...")
+
+
 @app.on_event("startup")
 async def startup_event():
     port = os.environ.get("PORT", 10000)
@@ -290,3 +402,35 @@ async def list_products(
         "productos_por_pagina": page_size,
         "total_productos": total_products
     }
+
+
+@app.get("/debug")
+async def debug_info():
+    """Endpoint para diagnóstico del sistema"""
+    try:
+        return {
+            "status": "ok",
+            "memory_usage_mb": get_memory_usage_mb(),
+            "system_state": {
+                "df_loaded": df is not None,
+                "df_shape": df.shape if df is not None else None,
+                "df_columns": df.columns.tolist() if df is not None else None,
+                "name_to_id_size": len(name_to_id) if name_to_id is not None else 0,
+                "id_to_name_size": len(id_to_name) if id_to_name is not None else 0,
+                "num_products": num_products,
+                "sample_names": list(name_to_id.keys())[:5] if name_to_id is not None else [],
+                "product_meta_shape": product_meta.shape if product_meta is not None else None,
+            },
+            "file_info": {
+                "base_dir": BASE_DIR,
+                "csv_exists": os.path.exists(os.path.join(BASE_DIR, "productos.csv")),
+                "model_exists": os.path.exists(os.path.join(BASE_DIR, "recomendacion.tflite")),
+                "directory_contents": os.listdir(BASE_DIR)
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
