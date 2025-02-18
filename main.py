@@ -9,6 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import LabelEncoder
 from contextlib import asynccontextmanager
 
+# For caching recommendations
+from functools import lru_cache
+
 def get_memory_usage_mb():
     process = psutil.Process(os.getpid())
     mem_bytes = process.memory_info().rss
@@ -16,31 +19,30 @@ def get_memory_usage_mb():
 
 print(f"Initial memory usage: {get_memory_usage_mb():.2f} MB")
 
-# Variables globales
+# Global variables
 id_to_name = None
 name_to_id = None
 num_products = None
 product_meta = None
-prod_weights = None
-main_weights = None
-sub_weights = None
 combined_embeddings_norm = None
 
-# Directorio base (donde se encuentra el CSV y el modelo)
+# A simple dictionary cache for recommendations
+recommendation_cache = {}
+
+# Define base directory (assumes CSV and model are in the same folder as this file)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global id_to_name, name_to_id, num_products, product_meta
-    global prod_weights, main_weights, sub_weights, combined_embeddings_norm
+    global id_to_name, name_to_id, num_products, product_meta, combined_embeddings_norm
 
     print("Starting startup...")
     try:
-        # Rutas a archivos
+        # Paths to files
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
         
-        # === Primera pasada: recopilar valores únicos ===
+        # === First Pass: Gather Unique Values ===
         usecols = ["name", "main_category", "sub_category"]
         all_names = set()
         all_main_categories = set()
@@ -56,80 +58,78 @@ async def lifespan(app: FastAPI):
         print(f"Found {len(all_main_categories)} unique main categories")
         print(f"Found {len(all_sub_categories)} unique sub categories")
         
-        # === Ajustar codificadores ===
+        # === Fit LabelEncoders ===
         name_enc = LabelEncoder()
         main_cat_enc = LabelEncoder()
         sub_cat_enc = LabelEncoder()
-        
         name_enc.fit(list(all_names))
         main_cat_enc.fit(list(all_main_categories))
         sub_cat_enc.fit(list(all_sub_categories))
         
-        # Crear diccionarios de mapeo para productos
+        # Create lookup dictionaries
         id_to_name = dict(zip(range(len(name_enc.classes_)), name_enc.classes_))
         name_to_id = {name: idx for idx, name in id_to_name.items()}
         num_products = len(name_enc.classes_)
         
-        # Preasignar array para metadata de productos:
-        # Columna 0: código de main_category, Columna 1: código de sub_category
+        # Preallocate metadata array: column 0 for main_category and column 1 for sub_category
         product_meta = np.zeros((num_products, 2), dtype=np.int32)
         
-        # === Segunda pasada: procesar CSV de forma vectorizada ===
+        # === Second Pass: Process CSV in a Vectorized Manner ===
         for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size, dtype=str):
-            # Mapear nombres a sus IDs
+            # Map names to their IDs
             ids = chunk['name'].map(name_to_id)
-            # Omitir registros sin mapeo (por precaución)
-            if ids.isnull().any():
-                valid = ids.notnull()
+            # Skip rows without valid mapping (for safety)
+            valid = ids.notnull()
+            if valid.any():
                 chunk = chunk[valid]
-                ids = ids[valid]
-            ids = ids.astype(np.int32).values
-            # Transformar categorías de forma vectorizada
-            main_encoded = main_cat_enc.transform(chunk['main_category'].values)
-            sub_encoded = sub_cat_enc.transform(chunk['sub_category'].values)
-            # Asignar en el array preasignado
-            product_meta[ids, 0] = main_encoded
-            product_meta[ids, 1] = sub_encoded
+                ids = ids[valid].astype(np.int32).values
+                main_encoded = main_cat_enc.transform(chunk['main_category'].values)
+                sub_encoded = sub_cat_enc.transform(chunk['sub_category'].values)
+                product_meta[ids, 0] = main_encoded
+                product_meta[ids, 1] = sub_encoded
         
-        print(f"Memory usage after creating metadata: {get_memory_usage_mb():.2f} MB")
+        print(f"Memory usage after metadata: {get_memory_usage_mb():.2f} MB")
         
-        # === Cargar modelo TFLite ===
+        # === Load TFLite Model and Extract Embeddings ===
         interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
         print("TFLite model loaded.")
-        
+
         def get_embedding_weights(layer_name):
             for tensor_detail in interpreter.get_tensor_details():
                 if layer_name in tensor_detail["name"]:
                     tensor = interpreter.get_tensor(tensor_detail["index"])
-                    print(f"Found tensor: {tensor_detail['name']} with shape {tensor.shape}")
                     if tensor.ndim >= 2:
                         return tensor.astype(np.float32)
-            raise ValueError(f"Tensor for {layer_name} with at least 2 dimensions not found")
+            raise ValueError(f"Tensor for {layer_name} not found")
         
-        prod_weights = get_embedding_weights("product_embedding")
-        main_weights = get_embedding_weights("main_cat_embedding")
-        sub_weights = get_embedding_weights("sub_cat_embedding")
+        # Get embeddings and convert to float16 for memory savings
+        prod_weights = get_embedding_weights("product_embedding").astype(np.float16)
+        main_weights = get_embedding_weights("main_cat_embedding").astype(np.float16)
+        sub_weights = get_embedding_weights("sub_cat_embedding").astype(np.float16)
         
-        # Liberar recursos del intérprete
+        # Release the interpreter and collect garbage
         del interpreter
         gc.collect()
         
-        # === Precalcular embeddings combinados normalizados ===
-        # Se asume:
-        # - prod_weights: (num_products, d_prod)
-        # - main_weights: (num_main_categories, d_main)
-        # - sub_weights: (num_sub_categories, d_sub)
-        # Se obtiene combined_embeddings de forma vectorizada:
+        # === Precompute Combined Embeddings ===
+        # We assume:
+        # - prod_weights: shape (num_products, d_prod)
+        # - main_weights: shape (num_main_categories, d_main)
+        # - sub_weights: shape (num_sub_categories, d_sub)
         combined_embeddings = np.concatenate([
             prod_weights,
             main_weights[product_meta[:, 0]],
             sub_weights[product_meta[:, 1]]
-        ], axis=1)
+        ], axis=1).astype(np.float16)
         
-        # Normalizar (añadimos un epsilon para evitar división por cero)
-        norms = np.linalg.norm(combined_embeddings, axis=1, keepdims=True)
-        combined_embeddings_norm = combined_embeddings / (norms + 1e-10)
+        # Normalize embeddings (temporarily cast to float32 for stability)
+        norms = np.linalg.norm(combined_embeddings.astype(np.float32), axis=1, keepdims=True)
+        combined_embeddings_norm = (combined_embeddings.astype(np.float32)) / (norms + 1e-10)
+        
+        # Free arrays that are no longer needed
+        del prod_weights, main_weights, sub_weights, combined_embeddings
+        gc.collect()
         
         print(f"Final memory usage after setup: {get_memory_usage_mb():.2f} MB")
         print("Startup completed. API is ready.")
@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
     yield
     print("Shutting down API...")
 
-# Crear aplicación FastAPI y configurar CORS
+# Create FastAPI app and set up CORS
 app = FastAPI(lifespan=lifespan, title="Product Recommendation API")
 app.add_middleware(
     CORSMiddleware,
@@ -151,31 +151,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Endpoint de Health Check
 @app.get("/")
 def health_check():
     return {"status": "ok"}
 
-# Endpoint de recomendaciones
+def compute_recommendations(product_id: int, top_n: int):
+    """
+    Compute the top_n recommendations for a given product_id using cosine similarity.
+    """
+    query_embedding = combined_embeddings_norm[product_id]
+    similarities = np.dot(combined_embeddings_norm, query_embedding)
+    similarities[product_id] = -np.inf  # Exclude the product itself
+    top_indices = np.argpartition(-similarities, top_n)[:top_n]
+    top_indices = top_indices[np.argsort(-similarities[top_indices])]
+    return top_indices.tolist()
+
 @app.get("/recomendaciones")
 def get_recomendaciones(product_name: str, top_n: int = 5):
-    global id_to_name, name_to_id, combined_embeddings_norm
+    global id_to_name, name_to_id, recommendation_cache
     
     if product_name not in name_to_id:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
     
     product_id = name_to_id[product_name]
-    # Obtener embedding del producto (ya normalizado)
-    query_embedding = combined_embeddings_norm[product_id]
-    # Calcular similitud coseno de forma vectorizada (producto punto)
-    similarities = np.dot(combined_embeddings_norm, query_embedding)
-    # Excluir el propio producto
-    similarities[product_id] = -np.inf
+    # Create a cache key based on product_id and top_n
+    cache_key = (product_id, top_n)
     
-    # Obtener los índices de los top_n productos recomendados
-    top_indices = np.argpartition(-similarities, top_n)[:top_n]
-    # Ordenarlos de forma descendente según la similitud
-    top_indices = top_indices[np.argsort(-similarities[top_indices])]
+    if cache_key in recommendation_cache:
+        top_indices = recommendation_cache[cache_key]
+    else:
+        top_indices = compute_recommendations(product_id, top_n)
+        recommendation_cache[cache_key] = top_indices
     
     recomendaciones = [
         {"id": int(pid), "name": id_to_name.get(int(pid), f"ID {pid}")}
@@ -184,8 +190,8 @@ def get_recomendaciones(product_name: str, top_n: int = 5):
     
     return {"producto": product_name, "recomendaciones": recomendaciones}
 
-# Ejecutar la aplicación con Uvicorn si se ejecuta directamente
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
+
