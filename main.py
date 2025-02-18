@@ -4,145 +4,223 @@ import psutil
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from typing import Dict, List, Optional, Generator
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import LabelEncoder
 from contextlib import asynccontextmanager
+import mmap
+import tempfile
+import logging
 
-# For caching recommendations
-from functools import lru_cache
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def get_memory_usage_mb():
-    process = psutil.Process(os.getpid())
-    mem_bytes = process.memory_info().rss
-    return mem_bytes / (1024 * 1024)
+class MemoryMonitor:
+    @staticmethod
+    def get_memory_usage_mb() -> float:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
 
-print(f"Initial memory usage: {get_memory_usage_mb():.2f} MB")
+    @staticmethod
+    def log_memory(message: str):
+        logger.info(f"{message} - Memory usage: {MemoryMonitor.get_memory_usage_mb():.2f} MB")
 
-# Global variables
-id_to_name = None
-name_to_id = None
-num_products = None
-product_meta = None
-combined_embeddings_norm = None
+class MemoryMappedEmbeddings:
+    def __init__(self, shape: tuple, dtype=np.float32):
+        self.shape = shape
+        self.dtype = dtype
+        self.temp_file = None
+        self.mmap_array = None
 
-# A simple dictionary cache for recommendations
-recommendation_cache = {}
+    def initialize(self):
+        # Create temporary file for memory mapping
+        self.temp_file = tempfile.NamedTemporaryFile(delete=False)
+        # Create empty file of required size
+        self.temp_file.write(b'\0' * (np.prod(self.shape) * np.dtype(self.dtype).itemsize))
+        self.temp_file.flush()
+        
+        # Create memory-mapped array
+        self.mmap_array = np.memmap(
+            self.temp_file.name,
+            dtype=self.dtype,
+            mode='r+',
+            shape=self.shape
+        )
 
-# Define base directory (assumes CSV and model are in the same folder as this file)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    def __del__(self):
+        if self.mmap_array is not None:
+            self.mmap_array._mmap.close()
+        if self.temp_file:
+            os.unlink(self.temp_file.name)
+
+class StreamingCSVProcessor:
+    def __init__(self, chunk_size: int = 1000):
+        self.chunk_size = chunk_size
+
+    def process_unique_values(self, csv_path: str) -> tuple:
+        names, main_cats, sub_cats = set(), set(), set()
+        
+        for chunk in pd.read_csv(
+            csv_path, 
+            usecols=["name", "main_category", "sub_category"],
+            dtype=str,
+            chunksize=self.chunk_size
+        ):
+            names.update(chunk['name'].dropna().unique())
+            main_cats.update(chunk['main_category'].dropna().unique())
+            sub_cats.update(chunk['sub_category'].dropna().unique())
+            
+            del chunk
+            gc.collect()
+        
+        return names, main_cats, sub_cats
+
+class RecommendationSystem:
+    def __init__(self):
+        self.id_to_name: Dict[int, str] = {}
+        self.name_to_id: Dict[str, int] = {}
+        self.embeddings: Optional[MemoryMappedEmbeddings] = None
+        self._mini_batch_size = 100  # Size for processing embeddings in batches
+        
+    def _process_embeddings_batch(self, query_id: int, start_idx: int, batch_size: int) -> np.ndarray:
+        """Process similarity computation in small batches"""
+        end_idx = min(start_idx + batch_size, self.embeddings.shape[0])
+        query_embedding = self.embeddings.mmap_array[query_id]
+        batch_similarities = np.dot(self.embeddings.mmap_array[start_idx:end_idx], query_embedding)
+        return batch_similarities
+
+    def get_recommendations(self, product_name: str, top_n: int = 5) -> List[Dict]:
+        if product_name not in self.name_to_id:
+            raise HTTPException(status_code=404, detail="Product not found")
+        
+        product_id = self.name_to_id[product_name]
+        num_products = self.embeddings.shape[0]
+        
+        # Process similarities in batches to reduce memory usage
+        all_similarities = []
+        for start_idx in range(0, num_products, self._mini_batch_size):
+            batch_similarities = self._process_embeddings_batch(
+                product_id, start_idx, self._mini_batch_size
+            )
+            all_similarities.extend(batch_similarities)
+        
+        # Convert to numpy array only for top-k selection
+        similarities = np.array(all_similarities)
+        similarities[product_id] = -np.inf
+        
+        # Get top-k indices
+        top_indices = np.argpartition(-similarities, top_n)[:top_n]
+        top_indices = top_indices[np.argsort(-similarities[top_indices])]
+        
+        return [
+            {
+                "id": int(idx),
+                "name": self.id_to_name[int(idx)],
+                "similarity": float(similarities[idx])
+            }
+            for idx in top_indices
+        ]
+
+recommender = RecommendationSystem()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global id_to_name, name_to_id, num_products, product_meta, combined_embeddings_norm
-
-    print("Starting startup...")
     try:
-        # Paths to files
+        MemoryMonitor.log_memory("Starting initialization")
+        
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
         
-        # === First Pass: Gather Unique Values ===
-        usecols = ["name", "main_category", "sub_category"]
-        all_names = set()
-        all_main_categories = set()
-        all_sub_categories = set()
+        # Process CSV in streaming fashion
+        csv_processor = StreamingCSVProcessor()
+        names, main_cats, sub_cats = csv_processor.process_unique_values(csv_path)
         
-        chunk_size = 1000
-        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size, dtype=str):
-            all_names.update(chunk['name'].unique())
-            all_main_categories.update(chunk['main_category'].unique())
-            all_sub_categories.update(chunk['sub_category'].unique())
+        # Create encoders
+        name_encoder = LabelEncoder().fit(list(names))
+        main_cat_encoder = LabelEncoder().fit(list(main_cats))
+        sub_cat_encoder = LabelEncoder().fit(list(sub_cats))
         
-        print(f"Found {len(all_names)} unique products")
-        print(f"Found {len(all_main_categories)} unique main categories")
-        print(f"Found {len(all_sub_categories)} unique sub categories")
+        # Set up ID mappings
+        recommender.id_to_name = dict(enumerate(name_encoder.classes_))
+        recommender.name_to_id = {name: idx for idx, name in recommender.id_to_name.items()}
         
-        # === Fit LabelEncoders ===
-        name_enc = LabelEncoder()
-        main_cat_enc = LabelEncoder()
-        sub_cat_enc = LabelEncoder()
-        name_enc.fit(list(all_names))
-        main_cat_enc.fit(list(all_main_categories))
-        sub_cat_enc.fit(list(all_sub_categories))
-        
-        # Create lookup dictionaries
-        id_to_name = dict(zip(range(len(name_enc.classes_)), name_enc.classes_))
-        name_to_id = {name: idx for idx, name in id_to_name.items()}
-        num_products = len(name_enc.classes_)
-        
-        # Preallocate metadata array: column 0 for main_category and column 1 for sub_category
-        product_meta = np.zeros((num_products, 2), dtype=np.int32)
-        
-        # === Second Pass: Process CSV in a Vectorized Manner ===
-        for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunk_size, dtype=str):
-            # Map names to their IDs
-            ids = chunk['name'].map(name_to_id)
-            # Skip rows without valid mapping (for safety)
-            valid = ids.notnull()
-            if valid.any():
-                chunk = chunk[valid]
-                ids = ids[valid].astype(np.int32).values
-                main_encoded = main_cat_enc.transform(chunk['main_category'].values)
-                sub_encoded = sub_cat_enc.transform(chunk['sub_category'].values)
-                product_meta[ids, 0] = main_encoded
-                product_meta[ids, 1] = sub_encoded
-        
-        print(f"Memory usage after metadata: {get_memory_usage_mb():.2f} MB")
-        
-        # === Load TFLite Model and Extract Embeddings ===
+        # Load TFLite model
         interpreter = tf.lite.Interpreter(model_path=model_path)
         interpreter.allocate_tensors()
-        print("TFLite model loaded.")
-
-        def get_embedding_weights(layer_name):
-            for tensor_detail in interpreter.get_tensor_details():
-                if layer_name in tensor_detail["name"]:
-                    tensor = interpreter.get_tensor(tensor_detail["index"])
-                    if tensor.ndim >= 2:
-                        return tensor.astype(np.float32)
-            raise ValueError(f"Tensor for {layer_name} not found")
         
-        # Get embeddings and convert to float16 for memory savings
-        prod_weights = get_embedding_weights("product_embedding").astype(np.float16)
-        main_weights = get_embedding_weights("main_cat_embedding").astype(np.float16)
-        sub_weights = get_embedding_weights("sub_cat_embedding").astype(np.float16)
+        def get_embedding_matrix(layer_name: str) -> np.ndarray:
+            for detail in interpreter.get_tensor_details():
+                if layer_name in detail["name"]:
+                    return interpreter.get_tensor(detail["index"])
+            raise ValueError(f"Layer {layer_name} not found")
         
-        # Release the interpreter and collect garbage
-        del interpreter
+        # Get embedding dimensions
+        prod_emb = get_embedding_matrix("product_embedding")
+        main_emb = get_embedding_matrix("main_cat_embedding")
+        sub_emb = get_embedding_matrix("sub_cat_embedding")
+        
+        combined_dim = prod_emb.shape[1] + main_emb.shape[1] + sub_emb.shape[1]
+        
+        # Initialize memory-mapped embeddings
+        recommender.embeddings = MemoryMappedEmbeddings(
+            shape=(len(names), combined_dim),
+            dtype=np.float32
+        )
+        recommender.embeddings.initialize()
+        
+        # Process data in chunks to populate embeddings
+        chunk_size = 1000
+        for chunk in pd.read_csv(csv_path, chunksize=chunk_size, dtype=str):
+            valid_mask = chunk['name'].isin(recommender.name_to_id)
+            if not valid_mask.any():
+                continue
+                
+            chunk = chunk[valid_mask]
+            product_ids = chunk['name'].map(recommender.name_to_id).values
+            
+            # Get embeddings for this chunk
+            main_cat_ids = main_cat_encoder.transform(chunk['main_category'])
+            sub_cat_ids = sub_cat_encoder.transform(chunk['sub_category'])
+            
+            # Combine embeddings
+            chunk_embeddings = np.concatenate([
+                prod_emb[product_ids],
+                main_emb[main_cat_ids],
+                sub_emb[sub_cat_ids]
+            ], axis=1)
+            
+            # Normalize chunk embeddings
+            norms = np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
+            chunk_embeddings /= (norms + 1e-8)
+            
+            # Update memory-mapped array
+            recommender.embeddings.mmap_array[product_ids] = chunk_embeddings
+            
+            del chunk_embeddings
+            gc.collect()
+        
+        # Clean up
+        del interpreter, prod_emb, main_emb, sub_emb
         gc.collect()
         
-        # === Precompute Combined Embeddings ===
-        # We assume:
-        # - prod_weights: shape (num_products, d_prod)
-        # - main_weights: shape (num_main_categories, d_main)
-        # - sub_weights: shape (num_sub_categories, d_sub)
-        combined_embeddings = np.concatenate([
-            prod_weights,
-            main_weights[product_meta[:, 0]],
-            sub_weights[product_meta[:, 1]]
-        ], axis=1).astype(np.float16)
+        MemoryMonitor.log_memory("Initialization complete")
         
-        # Normalize embeddings (temporarily cast to float32 for stability)
-        norms = np.linalg.norm(combined_embeddings.astype(np.float32), axis=1, keepdims=True)
-        combined_embeddings_norm = (combined_embeddings.astype(np.float32)) / (norms + 1e-10)
-        
-        # Free arrays that are no longer needed
-        del prod_weights, main_weights, sub_weights, combined_embeddings
-        gc.collect()
-        
-        print(f"Final memory usage after setup: {get_memory_usage_mb():.2f} MB")
-        print("Startup completed. API is ready.")
-    
     except Exception as e:
-        print(f"Error during startup: {str(e)}")
-        raise e
+        logger.error(f"Startup error: {str(e)}")
+        raise
     
     yield
-    print("Shutting down API...")
+    
+    # Cleanup
+    if recommender.embeddings:
+        del recommender.embeddings
+    gc.collect()
+    MemoryMonitor.log_memory("Shutdown complete")
 
-# Create FastAPI app and set up CORS
-app = FastAPI(lifespan=lifespan, title="Product Recommendation API")
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -151,44 +229,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def health_check():
-    return {"status": "ok"}
-
-def compute_recommendations(product_id: int, top_n: int):
-    """
-    Compute the top_n recommendations for a given product_id using cosine similarity.
-    """
-    query_embedding = combined_embeddings_norm[product_id]
-    similarities = np.dot(combined_embeddings_norm, query_embedding)
-    similarities[product_id] = -np.inf  # Exclude the product itself
-    top_indices = np.argpartition(-similarities, top_n)[:top_n]
-    top_indices = top_indices[np.argsort(-similarities[top_indices])]
-    return top_indices.tolist()
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "memory_usage_mb": MemoryMonitor.get_memory_usage_mb()
+    }
 
 @app.get("/recomendaciones")
-def get_recomendaciones(product_name: str, top_n: int = 5):
-    global id_to_name, name_to_id, recommendation_cache
-    
-    if product_name not in name_to_id:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    
-    product_id = name_to_id[product_name]
-    # Create a cache key based on product_id and top_n
-    cache_key = (product_id, top_n)
-    
-    if cache_key in recommendation_cache:
-        top_indices = recommendation_cache[cache_key]
-    else:
-        top_indices = compute_recommendations(product_id, top_n)
-        recommendation_cache[cache_key] = top_indices
-    
-    recomendaciones = [
-        {"id": int(pid), "name": id_to_name.get(int(pid), f"ID {pid}")}
-        for pid in top_indices
-    ]
-    
-    return {"producto": product_name, "recomendaciones": recomendaciones}
+async def get_recommendations(product_name: str, top_n: int = 5):
+    return {
+        "producto": product_name,
+        "recomendaciones": recommender.get_recommendations(product_name, top_n)
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
