@@ -3,17 +3,14 @@ import gc
 import psutil
 import numpy as np
 import pandas as pd
-from typing import Dict, List
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.preprocessing import LabelEncoder
 import logging
 import tempfile
 from pathlib import Path
-# Add this import at the top with the other imports
-from typing import Optional
-from contextlib import asynccontextmanager
-
+import traceback
 
 # Configure logging
 logging.basicConfig(
@@ -22,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app - mantener exactamente la misma estructura
+# Create FastAPI app
 app = FastAPI()
 
 # Add CORS middleware
@@ -33,123 +30,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global df, interpreter, id_to_name, name_to_id
-    global prod_weights, main_weights, sub_weights, num_products, product_meta
-
-    print("\n=== INICIO DEL PROCESO DE CARGA ===")
-    try:
-        # Verificar rutas de archivos
-        csv_path = os.path.join(BASE_DIR, "productos.csv")
-        model_path = os.path.join(BASE_DIR, "recomendacion.tflite")
-        
-        print(f"\n1. Verificación de archivos:")
-        print(f"   - BASE_DIR: {BASE_DIR}")
-        print(f"   - CSV Path: {csv_path}")
-        print(f"   - ¿Existe CSV?: {os.path.exists(csv_path)}")
-        
-        if not os.path.exists(csv_path):
-            print("   - Contenido del directorio:")
-            for file in os.listdir(BASE_DIR):
-                print(f"     * {file}")
-            raise FileNotFoundError(f"No se encontró productos.csv en {csv_path}")
-
-        # 1. Cargar CSV con debug
-        print("\n2. Cargando CSV:")
-        usecols = ["name", "discount_price", "actual_price", "main_category", "sub_category"]
-        print(f"   - Columnas a cargar: {usecols}")
-        
-        try:
-            # Primero leer solo las primeras líneas para verificar
-            print("   - Verificando primeras líneas del CSV:")
-            df_preview = pd.read_csv(csv_path, nrows=5)
-            print("   - Columnas encontradas en CSV:", df_preview.columns.tolist())
-            
-            # Cargar el CSV completo
-            df = pd.read_csv(csv_path, usecols=usecols, dtype=str)
-            print(f"   - CSV cargado exitosamente con {len(df)} filas")
-            print(f"   - Muestra de datos:\n{df.head()}")
-            
-            # Verificar valores nulos
-            null_counts = df.isnull().sum()
-            print(f"   - Valores nulos por columna:\n{null_counts}")
-            
-        except Exception as e:
-            print(f"   - Error al cargar CSV: {str(e)}")
-            raise
-
-        # Debug de procesamiento de precios
-        print("\n3. Procesamiento de precios:")
-        try:
-            print("   - Valores únicos en discount_price antes de limpieza:", df['discount_price'].unique()[:5])
-            df['discount_price'] = df['discount_price'].str.replace('₹', '').str.replace(',', '')
-            print("   - Valores después de limpieza:", df['discount_price'].unique()[:5])
-            df['discount_price'] = df['discount_price'].astype(np.float32)
-            print("   - Valores después de conversión a float:", df['discount_price'].unique()[:5])
-            
-            # Repetir para actual_price
-            print("\n   - Procesando actual_price...")
-            df['actual_price'] = df['actual_price'].str.replace('₹', '').str.replace(',', '').astype(np.float32)
-        except Exception as e:
-            print(f"   - Error en procesamiento de precios: {str(e)}")
-            raise
-
-        # Debug de codificación de variables
-        print("\n4. Codificación de variables:")
-        try:
-            name_enc = LabelEncoder()
-            print("   - Nombres únicos antes de codificación:", len(df['name'].unique()))
-            df['name_encoded'] = name_enc.fit_transform(df['name'])
-            print("   - Nombres únicos después de codificación:", len(df['name_encoded'].unique()))
-            print("   - Muestra de codificación:")
-            sample_encoding = df[['name', 'name_encoded']].head()
-            print(sample_encoding)
-            
-            # Crear y verificar mapeos
-            id_to_name = dict(zip(df['name_encoded'], df['name']))
-            name_to_id = {v: k for k, v in id_to_name.items()}
-            
-            print(f"\n5. Verificación de mapeos:")
-            print(f"   - Tamaño de id_to_name: {len(id_to_name)}")
-            print(f"   - Tamaño de name_to_id: {len(name_to_id)}")
-            print(f"   - Primeros 5 elementos de name_to_id:")
-            for i, (k, v) in enumerate(list(name_to_id.items())[:5]):
-                print(f"     {k}: {v}")
-            
-            # Verificar integridad de los mapeos
-            print("\n6. Verificación de integridad:")
-            print(f"   - ¿Todos los IDs tienen nombre?: {all(i in id_to_name for i in range(len(id_to_name)))}")
-            print(f"   - ¿Todos los nombres tienen ID?: {all(name in name_to_id for name in df['name'])}")
-            
-            # Verificar duplicados
-            duplicates = df['name'].value_counts()[df['name'].value_counts() > 1]
-            if not duplicates.empty:
-                print("\n   - Nombres duplicados encontrados:")
-                print(duplicates)
-            
-        except Exception as e:
-            print(f"   - Error en codificación de variables: {str(e)}")
-            raise
-
-        print("\n=== FIN DEL PROCESO DE CARGA ===")
-
-    except Exception as e:
-        print(f"\nERROR FATAL: {str(e)}")
-        import traceback
-        print(f"Traceback completo:\n{traceback.format_exc()}")
-        raise e
-
-    yield
-    print("Apagando API...")
-
-
-#@app.on_event("startup")
-#async def startup_event():
-    #port = os.environ.get("PORT", 10000)
-    #logger.info(f"Application startup on port {port}")
 
 class MemoryEfficientStore:
     def __init__(self, chunk_size: int = 100):
@@ -296,26 +176,23 @@ class RecommendationSystem:
             logger.error(f"Error getting recommendations: {e}")
             raise HTTPException(status_code=500, detail="Error computing recommendations")
 
+# Initialize recommender
 recommender = RecommendationSystem()
 
 @app.on_event("startup")
 async def startup_event():
-    port = os.environ.get("PORT", 10000)
-    logger.info(f"Application startup on port {port}")
-    
     try:
         # Get file path
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         csv_path = os.path.join(BASE_DIR, "productos.csv")
         
-        # Process data
         logger.info("Starting data processing")
         recommender.process_data(csv_path)
         logger.info("Data processing complete")
         
     except Exception as e:
         logger.error(f"Error during startup: {e}")
-        # No raise here - let the app start even if data processing fails
+        logger.error(traceback.format_exc())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -346,7 +223,6 @@ async def get_recommendations(product_name: str, top_n: int = 5):
         "recomendaciones": recommender.get_recommendations(product_name, top_n)
     }
 
-# Add this new endpoint after the existing endpoints
 @app.get("/productos")
 async def list_products(
     page: Optional[int] = 1,
@@ -355,38 +231,26 @@ async def list_products(
 ):
     """
     List available products with optional pagination and search.
-    
-    Args:
-        page: Current page number (1-based indexing)
-        page_size: Number of items per page
-        search: Optional search term to filter products
     """
-    # Validate pagination parameters
     if page < 1:
         raise HTTPException(status_code=400, detail="Page number must be >= 1")
     if page_size < 1 or page_size > 100:
         raise HTTPException(status_code=400, detail="Page size must be between 1 and 100")
     
-    # Get all product names
     products = list(recommender.name_to_id.keys())
     
-    # Apply search filter if provided
     if search:
         search = search.lower()
         products = [p for p in products if search in p.lower()]
     
-    # Sort products alphabetically for consistent pagination
     products.sort()
     
-    # Calculate pagination
     total_products = len(products)
     total_pages = (total_products + page_size - 1) // page_size
     
-    # Adjust page if it exceeds total pages
     if page > total_pages and total_pages > 0:
         raise HTTPException(status_code=404, detail="Page not found")
     
-    # Get paginated results
     start_idx = (page - 1) * page_size
     end_idx = min(start_idx + page_size, total_products)
     page_products = products[start_idx:end_idx]
@@ -399,29 +263,22 @@ async def list_products(
         "total_productos": total_products
     }
 
-
 @app.get("/debug")
 async def debug_info():
     """Endpoint para diagnóstico del sistema"""
     try:
         return {
             "status": "ok",
-            "memory_usage_mb": get_memory_usage_mb(),
+            "memory_usage_mb": psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024),
             "system_state": {
-                "df_loaded": df is not None,
-                "df_shape": df.shape if df is not None else None,
-                "df_columns": df.columns.tolist() if df is not None else None,
-                "name_to_id_size": len(name_to_id) if name_to_id is not None else 0,
-                "id_to_name_size": len(id_to_name) if id_to_name is not None else 0,
-                "num_products": num_products,
-                "sample_names": list(name_to_id.keys())[:5] if name_to_id is not None else [],
-                "product_meta_shape": product_meta.shape if product_meta is not None else None,
+                "id_to_name_size": len(recommender.id_to_name),
+                "name_to_id_size": len(recommender.name_to_id),
+                "sample_names": list(recommender.name_to_id.keys())[:5]
             },
             "file_info": {
-                "base_dir": BASE_DIR,
-                "csv_exists": os.path.exists(os.path.join(BASE_DIR, "productos.csv")),
-                "model_exists": os.path.exists(os.path.join(BASE_DIR, "recomendacion.tflite")),
-                "directory_contents": os.listdir(BASE_DIR)
+                "base_dir": os.path.dirname(os.path.abspath(__file__)),
+                "csv_exists": os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "productos.csv")),
+                "directory_contents": os.listdir(os.path.dirname(os.path.abspath(__file__)))
             }
         }
     except Exception as e:
@@ -431,10 +288,17 @@ async def debug_info():
             "traceback": traceback.format_exc()
         }
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    print(f"Starting server on port {port}")
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
+    try:
+        port = int(os.environ.get("PORT", 10000))
+        logger.info(f"Starting server on port {port}")
+        import uvicorn
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=port,
+            log_level="info"
+        )
+    except Exception as e:
+        logger.error(f"Error starting server: {e}")
+        logger.error(traceback.format_exc())
