@@ -8,6 +8,7 @@ import psutil
 import gc
 import numpy as np
 from recommender import ImprovedRecommender
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -46,7 +47,7 @@ def init_app():
         # Optimize DataFrame loading - use appropriate dtypes
         try:
             with open(models_dir / 'products_df_dtypes.json', 'r') as f:
-                import json
+                
                 dtypes = json.load(f)
                 products_df = pd.read_pickle(models_dir / 'products_df.pkl')
                 # Convert columns to optimized dtypes
