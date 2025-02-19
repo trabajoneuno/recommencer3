@@ -430,3 +430,20 @@ async def debug_info():
             "error": str(e),
             "traceback": traceback.format_exc()
         }
+
+
+
+# At the bottom of your file, add this:
+import uvicorn
+
+if __name__ == "__main__":
+    # Get port from environment variable or use default
+    port = int(os.environ.get("PORT", 10000))
+    
+    # Run the app with the specified host and port
+    uvicorn.run(
+        "main:app",  # Change "main" to your actual file name without .py
+        host="0.0.0.0",
+        port=port,
+        reload=False
+    )
