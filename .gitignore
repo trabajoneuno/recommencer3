@@ -1,0 +1,19 @@
+# Ignorar entornos virtuales
+venv/
+.env/
+
+# Ignorar cachés de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignorar archivos de bloqueo y temporales
+~*
+*.swp
+.DS_Store
+Thumbs.db
+
+# Ignorar dependencias específicas
+requirements1.txt
+
