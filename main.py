@@ -146,10 +146,10 @@ async def lifespan(app: FastAPI):
     print("Apagando API...")
 
 
-@app.on_event("startup")
-async def startup_event():
-    port = os.environ.get("PORT", 10000)
-    logger.info(f"Application startup on port {port}")
+#@app.on_event("startup")
+#async def startup_event():
+    #port = os.environ.get("PORT", 10000)
+    #logger.info(f"Application startup on port {port}")
 
 class MemoryEfficientStore:
     def __init__(self, chunk_size: int = 100):
