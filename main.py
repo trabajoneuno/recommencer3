@@ -231,8 +231,8 @@ class RecommendationSystem:
     def process_data(self, csv_path: str):
         chunk_size = 500
         
-        # Process unique values
-        unique_values = {"name": set(), "category": set()}
+        # Modificar para usar main_category en lugar de category
+        unique_values = {"name": set(), "main_category": set()}
         for chunk in pd.read_csv(csv_path, usecols=list(unique_values.keys()), 
                                dtype=str, chunksize=chunk_size):
             for col in unique_values:
@@ -260,19 +260,13 @@ class RecommendationSystem:
             for _, row in chunk.iterrows():
                 product_id = self.name_to_id[row['name']]
                 
-                # Create simple embedding from category
-                category_id = encoders["category"].transform([row['category']])[0]
+                # Modificar para usar main_category
+                category_id = encoders["main_category"].transform([row['main_category']])[0]
                 embedding = np.zeros(50, dtype=np.float32)
                 embedding[category_id % 50] = 1
                 
                 # Store embedding
                 self.embedding_store.add_embedding(product_id, embedding)
-            
-            del chunk
-            gc.collect()
-        
-        # Save final chunk
-        self.embedding_store._save_chunk()
     
     def get_recommendations(self, product_name: str, top_n: int = 5) -> List[Dict]:
         if product_name not in self.name_to_id:
