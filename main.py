@@ -1,10 +1,10 @@
 # main.py
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from joblib import load
+import pickle
 import os
 
-# Definición del modelo
+# IMPORTANTE: La clase debe estar definida EXACTAMENTE igual que cuando creaste el modelo
 class ModeloRecomendacion:
     def __init__(self, similarity_df):
         self.similarity_df = similarity_df
@@ -16,28 +16,6 @@ class ModeloRecomendacion:
         similar_producto = similar_producto[1:]
         return dict(similar_producto)
 
-# Obtener la ruta absoluta al archivo joblib
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-modelo_path = os.path.join(BASE_DIR, 'modelo_recomendacion.joblib')
-
-# Cargar el modelo
-try:
-    modelo = load(modelo_path)
-except Exception as e:
-    print(f"Error al cargar el modelo: {str(e)}")
-    modelo = None
-
-# Función de recomendación
-def obtener_recomendaciones(producto):
-    if modelo is None:
-        return {"error": "Modelo no disponible"}
-    try:
-        recomendaciones = modelo.recomendar_producto(producto)
-        return recomendaciones
-    except Exception as e:
-        print(f"Error al obtener recomendaciones: {str(e)}")
-        return {}
-
 # Crear la aplicación FastAPI
 app = FastAPI(
     title="API de Recomendaciones",
@@ -45,19 +23,54 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Cargar el modelo usando pickle en lugar de joblib
+try:
+    with open('modelo_recomendacion.pkl', 'rb') as file:
+        modelo = pickle.load(file)
+    print("Modelo cargado exitosamente")
+except Exception as e:
+    print(f"Error al cargar el modelo: {str(e)}")
+    modelo = None
+
 @app.get("/")
 def read_root():
-    return {"message": "API de Recomendaciones activa"}
+    if modelo is None:
+        return {"message": "API activa pero modelo no cargado"}
+    return {"message": "API activa y modelo cargado correctamente"}
 
 @app.get("/recomendar/{producto}")
 async def recomendar(producto: str):
-    recomendaciones = obtener_recomendaciones(producto)
-    if not recomendaciones:
+    if modelo is None:
         raise HTTPException(
-            status_code=404,
-            detail="Producto no encontrado o error en las recomendaciones"
+            status_code=500,
+            detail="Modelo no disponible"
         )
-    return recomendaciones
+    
+    try:
+        recomendaciones = modelo.recomendar_producto(producto)
+        if not recomendaciones:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Producto '{producto}' no encontrado"
+            )
+        return recomendaciones
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al procesar la recomendación: {str(e)}"
+        )
+
+@app.get("/productos-disponibles")
+async def productos_disponibles():
+    if modelo is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Modelo no disponible"
+        )
+    return {
+        "total_productos": len(modelo.similarity_df.columns),
+        "ejemplos": list(modelo.similarity_df.columns[:5])
+    }
 
 if __name__ == "__main__":
     import uvicorn
